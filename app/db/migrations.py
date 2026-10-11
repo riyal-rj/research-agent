@@ -8,7 +8,7 @@ from typing import TypeAlias
 from app.core.config import settings_inst, Settings
 from app.db.pool import get_pool 
 from app.core.logging_config import setup_logging
-from app.llm.emebeddings import EMBEDDING_DIM
+from app.llm.embeddings import EMBEDDING_DIM
 
 logger = setup_logging(__name__)
 
@@ -124,9 +124,10 @@ async def db_migrate(config:Settings | None = None) -> None:
     """
 
     dim = int(EMBEDDING_DIM)
-    lists = config.ivfflat_lists if config is not None else None
+    lists = config.ivfflat_lists if config is not None else 0
     started = time.perf_counter()
     created: list[str] = []
+    pg_vector: str | None = None
 
     async with get_pool().acquire() as connection:
         connection.add_log_listener(_forward_server_notice)
@@ -145,9 +146,68 @@ async def db_migrate(config:Settings | None = None) -> None:
                         waited
                     )
                 await connection.execute(
-                    """
-                        SELECT extrversion 
-                        FROM pg_extension
-                        WHERE extname = "vector"
+                    f"""
+                        SET LOCK
+                        lock_timeout = '{DDL_LOCK_TIMEOUT}'
                     """
                 )
+
+                pg_vector = await connection.fetchval(
+                    """
+                        SELECT extversion 
+                        FROM pg_extension 
+                        WHERE extname = 'vector'
+                    """
+                )
+                if pg_vector is None:
+                    await _create_extension(connection)
+                    pg_vector = await connection.fetchval(
+                        """
+                            SELECT extversion 
+                            FROM pg_extension 
+                            WHERE extname = 'vector'
+                        """
+                    )
+                    created.append("extension vector")
+                if await connection.fetchval(
+                    """
+                        SELECT extversion 
+                        FROM pg_extension 
+                        WHERE extname = 'vector'
+                    """) is None:
+                    await connection.execute(_table_ddl(dim))
+                    created.append("table reports")
+                else:
+                    await _check_emebedding_dim(connection, dim)
+
+                for name, ddl in _index_ddl(lists).items():
+                    if await connection.fetchval(
+                        "SELECT to_regclass($1)",
+                        name) is None:
+                        await connection.execute(ddl)
+                        created.append(f"index {name}")
+                await _warn_on_lists_draft(connection, lists)
+        except Exception as exc:
+            logger.error(
+                "Schema migration failed, rolled back: %s: %s",
+                type(exc).__name__,
+                exc
+            )
+        finally:
+            connection.remove_log_listener(_forward_server_notice)
+
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if created:
+        logger.info(
+            "Schema migration applied in %.0f ms (pgvector %s): created %s",
+            elapsed_ms, 
+            pg_vector, 
+            ", ".join(created),
+        )
+    else:
+        logger.info(
+            "Schema up to date (pgvector %s), checked in %.0f ms", 
+            pg_vector, 
+            elapsed_ms
+        )
+
